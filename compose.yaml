@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: vkassist-postgres
+    environment:
+      POSTGRES_DB: vkassist
+      POSTGRES_USER: vkassist
+      POSTGRES_PASSWORD: vkassist
+    ports:
+      - "5434:5432"
+    volumes:
+      - vkassist_data:/var/lib/postgresql/data
+
+volumes:
+  vkassist_data:
