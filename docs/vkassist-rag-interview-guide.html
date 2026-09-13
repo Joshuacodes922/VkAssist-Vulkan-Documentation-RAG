@@ -1,0 +1,136 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>vkassist RAG Pipeline — Interview Guide</title>
+<style>
+@page { size: A4; margin: 15mm 14mm 16mm; @bottom-right { content: "vkassist interview guide"; color:#777; font-size:8pt; } }
+*{box-sizing:border-box} body{font-family:Arial,Helvetica,sans-serif;color:#17202a;line-height:1.5;font-size:10.3pt;margin:0}
+h1,h2,h3{color:#a82e27;line-height:1.18} h1{font-size:29pt;margin:0 0 7px} h2{font-size:18pt;border-bottom:2px solid #e43d30;padding-bottom:5px;margin:25px 0 10px} h3{font-size:12.5pt;margin:18px 0 5px}
+p{margin:7px 0} li{margin:4px 0}.cover{min-height:255mm;display:flex;flex-direction:column;justify-content:center;border-left:10px solid #e43d30;padding-left:20px}.tag{color:#e43d30;font-weight:bold;letter-spacing:1.5px;font-size:10pt}.sub{font-size:14pt;color:#59636d;max-width:580px}.meta{margin-top:35px;color:#59636d}.page{break-before:page}.diagram{background:#121821;color:#e9edf0;border-radius:8px;padding:16px;font-family:Consolas,monospace;font-size:8.8pt;white-space:pre-wrap;line-height:1.55}.code{background:#10151c;color:#e8edf3;border-radius:7px;padding:12px;white-space:pre-wrap;font-family:Consolas,monospace;font-size:8.2pt;line-height:1.42;overflow-wrap:anywhere}.note{background:#fff3ef;border-left:4px solid #e43d30;padding:9px 12px;margin:11px 0}.good{background:#edf8f1;border-left:4px solid #27864e;padding:9px 12px;margin:11px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.card{border:1px solid #d9dfe3;border-radius:7px;padding:10px}.card h3{margin-top:0}table{border-collapse:collapse;width:100%;font-size:9pt;margin:10px 0}th{background:#202833;color:white;text-align:left}th,td{border:1px solid #cdd3d8;padding:7px;vertical-align:top}.qa{border:1px solid #d9dfe3;border-radius:7px;padding:10px;margin:9px 0}.qa b{color:#a82e27}.small{font-size:8.7pt;color:#53616c}
+</style></head><body>
+<section class="cover"><div class="tag">SYSTEM DESIGN + INTERVIEW PREPARATION</div><h1>vkassist<br>RAG Pipeline</h1><p class="sub">A code-grounded explanation of the Vulkan documentation retrieval-augmented generation system: design decisions, trade-offs, alternatives, evaluation, and honest production limitations.</p><p class="meta">Repository scope: PDF ingestion → structure-aware chunks → pgvector + BM25 hybrid retrieval → RRF → cross-encoder reranking → parent context → cited answer generation.</p></section>
+
+<section class="page"><h2>1. The one-minute explanation</h2>
+<p><b>vkassist is a retrieval-augmented generation system for Vulkan documentation.</b> It does not rely on an LLM's memory to answer technical questions. It first extracts and indexes the source PDF, retrieves evidence with both semantic and lexical search, fuses and optionally reranks candidates, expands the winning chunk with local or parent context, and finally asks a model to answer only from those passages with numbered citations.</p>
+<div class="diagram">OFFLINE INGESTION
+PDF → PyMuPDF layout blocks + TOC → sections (parents) + bounded child chunks
+    → embedding text (section/page/API symbols/content) → BGE vectors → PostgreSQL + pgvector
+    → raw chunk text → BM25 in-memory index
+
+ONLINE QUERY
+query → BGE query vector ───────────────┐
+      → pgvector cosine top 20           │
+query → identifier-aware BM25 top 20 ────┼→ Reciprocal Rank Fusion → top candidates
+                                         └→ Cross-encoder reranker → top 5
+top child → adjacent children / full parent → grounded LLM prompt → answer + cited pages</div>
+<div class="good"><b>Interview framing:</b> “I separated retrieval quality from generation quality. The LLM is the final writer, not the search engine; evidence retrieval is deterministic enough to benchmark independently.”</div>
+
+<h2>2. Corpus and ingestion: why a PDF needs more than text splitting</h2>
+<p>The source is <code>data/vulkan_documentation.pdf</code>. PDFs encode visual layout, not a reliable semantic document tree. Naively calling <code>page.get_text()</code> and cutting every N characters creates chunks that cross paragraphs, detach code from explanations, include repeated headers/footers, and lose the chapter hierarchy that makes technical documentation navigable.</p>
+<h3>Current implementation</h3>
+<p><code>app/ingestion/chunker.py</code> uses PyMuPDF blocks, the embedded table of contents, and printed-heading detection. A block preserves a coherent layout unit (typically a paragraph, heading, or code block). Before indexing, it normalizes common PDF noise, removes recurring marginal text, ignores isolated page numbers, and identifies Vulkan API names and VUIDs.</p>
+<div class="code"># app/ingestion/chunker.py
+for block in page.get_text("blocks", sort=True):
+    text = normalize_text(block[4])
+    if not text or (is_margin and marginal_fingerprint(text) in ignored_margins):
+        continue
+    is_code = is_code_block(text)
+    blocks.append(TextBlock(page_number, text, is_code, ...))
+
+def extract_api_symbols(text):
+    patterns = [r"\bvk[A-Z][A-Za-z0-9_]*\b", r"\bVk[A-Z][A-Za-z0-9_]*\b",
+                r"\bVK_[A-Z0-9_]+\b", r"\bVUID-[A-Za-z0-9_-]+\b"]</div>
+<p>The TOC becomes a hierarchical path such as <i>Drawing a triangle &gt; Presentation &gt; Swap chain</i>. A deterministic hash of document name, section path, and section start page becomes the section key. This makes section identity stable across a re-ingestion as long as the source structure is stable.</p>
+</section>
+
+<section class="page"><h2>3. Chunking strategy: structure-aware, parent-child, and bounded overlap</h2>
+<p>This is <b>structure-aware parent-child chunking</b>, not pure semantic chunking. The parent is a complete TOC-derived section; children are retrieval-sized chunks made by packing whole layout blocks. The system ranks small children for precision, then recovers nearby or full parent context for generation.</p>
+<table><tr><th>Design choice</th><th>Current behavior</th><th>Reason</th></tr>
+<tr><td>Chunk budget</td><td>350 words</td><td>Small enough for focused retrieval and cross-encoder scoring; large enough to retain a useful technical explanation.</td></tr>
+<tr><td>Overlap</td><td>Up to 60 words, using complete trailing blocks</td><td>Preserves a boundary concept without slicing sentences or code arbitrarily.</td></tr>
+<tr><td>Unit of packing</td><td>Paragraph/code layout blocks</td><td>Protects code and paragraphs from fixed-token fragmentation.</td></tr>
+<tr><td>Parent</td><td>Full structural section, stored separately</td><td>Lets answer generation see broader explanation without making every vector too broad.</td></tr></table>
+<div class="code"># pack_blocks: retain coherent blocks; overlap only the tail blocks
+if current and current_words + unit_words > chunk_size:
+    packed.append(("\n\n".join(item.text for item in current), ...))
+    # retain up to overlap_words from complete tail blocks
+    current, current_words = overlap, overlap_count</div>
+<h3>Why this over alternatives?</h3><div class="grid">
+<div class="card"><h3>Fixed token windows</h3><p>Cheap and common baseline, but split code, headings, and lists. Your design improves document fidelity with modest extra parsing complexity.</p></div>
+<div class="card"><h3>Semantic breakpoint chunking</h3><p>Can adapt to topic shifts using embeddings, but is less predictable, can overfit embedding noise, and does not inherently preserve the PDF's chapter hierarchy.</p></div>
+<div class="card"><h3>One vector per section</h3><p>Excellent context but weak precision: a long section averages several ideas into one vector. Parent-child gets precision first, context second.</p></div>
+<div class="card"><h3>Late-interaction / ColBERT</h3><p>Often stronger for exact token interactions, but requires a different index and higher operational/storage complexity. It is a future retrieval experiment, not a free replacement.</p></div></div>
+<div class="note"><b>Honest limitation:</b> code detection is heuristic and the PDF parser depends on the source layout. For a broad multi-document corpus, add parser regression tests per document family and inspect extraction failures.</div>
+
+<h2>4. Persistence and embedding representation</h2>
+<p>Ingestion stores <code>DocumentSection</code> parents and <code>DocumentChunk</code> children in PostgreSQL. Each child has source page ranges, a section foreign key, API-symbol metadata, text, and a 768-dimensional pgvector embedding. Page metadata is essential: it supports UI citations and page-level evaluation.</p>
+<div class="code">embedding_text = build_embedding_text(
+    document_name=chunk.document_name, section=chunk.section,
+    page_number=chunk.page_number, content=chunk.content,
+    api_symbols=chunk.api_symbols)
+embeddings = model.encode_document(texts, batch_size=32,
+    normalize_embeddings=True)</div>
+<p>The model is <b>BAAI/bge-base-en-v1.5</b>. BGE is a good quality/latency baseline for semantic retrieval. Normalization makes cosine similarity well behaved and consistent with the pgvector cosine operator. The model object is cached once with <code>lru_cache</code>, avoiding repeated downloads/load time.</p>
+</section>
+
+<section class="page"><h2>5. Retrieval: dense, lexical, hybrid, and fusion</h2>
+<h3>Dense retrieval</h3><p>A query is embedded with <code>encode_query(..., normalize_embeddings=True)</code>. PostgreSQL orders chunks by pgvector cosine distance and returns the top candidate set (default 20). Dense retrieval catches semantic paraphrases: “how does presenting work?” can retrieve swap-chain passages even if the wording differs.</p>
+<div class="code">distance = DocumentChunk.embedding.cosine_distance(query_embedding)
+statement = select(DocumentChunk, distance.label("distance")).order_by(distance).limit(limit)</div>
+<h3>BM25 retrieval</h3><p>BM25 is exact/lexical retrieval. It is particularly valuable in Vulkan because identifiers are meaningful: <code>VUID-vkQueueSubmit-pWaitSemaphores-03238</code>, <code>VK_PIPELINE_STAGE_2_TRANSFER_BIT</code>, and <code>vkCmdPipelineBarrier2</code> should not be treated like ordinary prose.</p>
+<div class="code">return re.findall(
+ r"VUID-[A-Za-z0-9_-]+|VK_[A-Z0-9_]+|vk[A-Za-z0-9_]+|Vk[A-Za-z0-9_]+|[A-Za-z0-9]+", text)</div>
+<p>The current BM25 index is built in process from all stored chunks whenever <code>BM25Retriever()</code> is created. That is fine for this small corpus and makes the lexical index simple to reason about; it is not the final design for a large, frequently updated corpus.</p>
+<h3>Why hybrid search?</h3><p>Dense search has recall for meaning; BM25 has precision for rare tokens. Neither dominates on all questions. Hybrid retrieval protects the system from dense failures on identifiers and BM25 failures on paraphrases.</p>
+<h3>Why Reciprocal Rank Fusion (RRF), not raw-score averaging?</h3><p>Cosine similarity and BM25 scores live on unrelated scales. RRF combines <i>rank positions</i>, so no fragile calibration is needed. A result gets <code>1 / (60 + rank)</code> from each list. A passage that both methods like rises; a strong one-method result still survives.</p>
+<div class="code">combined[chunk_id]["score"] += 1.0 / (rrf_constant + result.rank)
+# default rrf_constant = 60</div>
+<table><tr><th>Alternative</th><th>Why not the current default?</th></tr><tr><td>Weighted score normalization</td><td>Requires calibrating incomparable scores and retuning when corpus/model changes.</td></tr><tr><td>Learned fusion</td><td>Potentially stronger, but needs labeled training data and feature monitoring.</td></tr><tr><td>Dense only</td><td>Weak for VUIDs and exact API constants.</td></tr><tr><td>BM25 only</td><td>Misses natural-language paraphrases and conceptual questions.</td></tr></table>
+</section>
+
+<section class="page"><h2>6. Cross-encoder reranking and context reconstruction</h2>
+<p>After RRF, the system uses <b><code>cross-encoder/ms-marco-MiniLM-L6-v2</code></b> to score each <code>(query, chunk)</code> pair jointly. Bi-encoder retrieval compares independently precomputed vectors, which is fast but approximate. A cross-encoder reads query and passage together and can model fine-grained relevance; it is more expensive, so it is used only on a small candidate set.</p>
+<div class="code">pairs = [(query, candidate.chunk.content) for candidate in candidates]
+scores = get_reranker().predict(pairs)
+ranked = sorted(scored_candidates, key=lambda c: c.reranker_score, reverse=True)
+return ranked[:limit]  # default 5</div>
+<p><b>Important interview honesty:</b> the existing benchmark reports should decide whether reranking is enabled by default, not intuition. Earlier measurements showed reranking can reduce quality on the current evaluation set. That does not mean cross-encoders are “bad”; it means candidate depth, model/domain fit, labels, or chunk construction need calibration. A production-minded engineer reports that result and investigates it.</p>
+<h3>Parent sliding window</h3><p>Ranking a single child is precise but sometimes too narrow to answer safely. After ranking, <code>add_parent_context</code> fetches chunks with neighboring <code>chunk_index</code> values in the same <code>section_id</code>. <code>context_window=1</code> means the hit plus one sibling on either side. <code>parent_context=true</code> also attaches the full parent section.</p>
+<div class="code">where(DocumentChunk.chunk_index.between(
+    chunk.chunk_index - window_size, chunk.chunk_index + window_size))
+where(DocumentChunk.section_id == chunk.section_id)</div>
+<p>This sequence matters: <b>retrieve narrowly, expand afterward.</b> Expanding before vector search would dilute child precision; expanding after ranking retains local continuity for the generator.</p>
+<div class="note"><b>Current caveat:</b> child <code>chunk_index</code> is global ingestion order, then constrained by section ID. It works because section filtering is applied. A more explicit <code>position_in_section</code> column would make the model clearer and safer for multi-document ingestion.</div>
+
+<h2>7. Grounded answer generation and citations</h2>
+<p>The LLM is optional. The retrieval endpoint works without it; the answer endpoint requires an OpenAI-compatible model endpoint, such as local Ollama Qwen. The system passes only numbered retrieved passages, asks for a short answer, and requires <code>[n]</code> citations for factual claims.</p>
+<div class="code">prompt = "Answer only from the supplied Vulkan documentation passages. " +
+         "Use at most three concise sentences. Cite every factual claim using [n]."
+payload = { "temperature": 0, "response_format": {"type":"json_object"},
+            "reasoning_effort": "none" }</div>
+<p>Output handling removes <code>&lt;think&gt;</code> traces, parses JSON, rejects empty/ellipsis placeholders, retries once, then filters returned metadata down to citations that the answer actually referenced. An asyncio lock serializes generation, a practical protection for a small local model that can become unstable or slow under concurrent requests.</p>
+</section>
+
+<section class="page"><h2>8. API, operations, and evaluation</h2>
+<h3>API contract</h3><p>FastAPI exposes <code>POST /v1/search</code> for evidence and <code>POST /v1/answers</code> for cited answers; <code>GET /health</code> verifies Postgres connectivity and <code>GET /metrics</code> exposes basic request/error/latency counters. Pydantic limits query length and result count. Startup creates the pgvector extension/table/index and warms the embedding and reranker models.</p>
+<p>The database creates an HNSW cosine index. HNSW is an approximate-nearest-neighbor choice that improves vector retrieval as the corpus grows, unlike a linear scan. PostgreSQL also keeps source metadata and relational parent/child links in one operational system.</p>
+<h3>Evaluation methodology</h3><p><code>data/evaluation/vulkan_retrieval.json</code> contains page-level relevance labels. The evaluator records Recall@k, MRR@k, nDCG@k and P50/P95 latency for reranked and non-reranked configurations. It deliberately deduplicates relevant pages before nDCG, preventing overlapping chunks from inflating the metric.</p>
+<div class="code">new_pages = (result_pages & relevant_pages) - covered_pages
+if new_pages:
+    relevant_ranks.append(rank)
+    covered_pages.update(new_pages)</div>
+<table><tr><th>Metric</th><th>Interview explanation</th></tr><tr><td>Recall@k</td><td>Did the top-k cover the known source pages? Good for evidence availability.</td></tr><tr><td>MRR@k</td><td>How early is the first useful result? Good for answer quality and user experience.</td></tr><tr><td>nDCG@k</td><td>Does the ranked list place distinct relevant evidence near the top?</td></tr><tr><td>P50 / P95 latency</td><td>Median experience and tail risk; reranking/generation can affect P95 substantially.</td></tr></table>
+<div class="good"><b>Evaluation rule:</b> change one retrieval variable at a time, run the same labeled set, compare quality and latency, inspect failed queries, then decide whether the extra complexity is justified.</div>
+
+<h2>9. What is production-ready, and what is next?</h2>
+<p>This is a credible production-minded foundation: grounded sources, API validation, PostgreSQL/pgvector, HNSW, CORS, health/metrics, model warmup, citations, error handling, an evaluation harness, CI tests, and a user-facing evidence viewer.</p>
+<table><tr><th>Next improvement</th><th>Why it matters</th></tr><tr><td>Persistent BM25 / search engine</td><td>Current BM25 is rebuilt in memory; move it to Elasticsearch/OpenSearch or a persisted lexical index for scale and updates.</td></tr><tr><td>Alembic migrations</td><td>Replace lightweight startup ALTER statements with versioned, reviewable schema migrations.</td></tr><tr><td>Observability</td><td>Add structured logs, traces, per-stage latency, retrieval IDs, model version, and citation/answer quality monitoring.</td></tr><tr><td>Evaluation expansion</td><td>More adversarial VUIDs, negative queries, section/chunk labels, human faithfulness review, and regression gates.</td></tr><tr><td>Reranker tuning</td><td>Test candidate depth, domain rerankers, and score/quality deltas before making it a hard default.</td></tr><tr><td>Security + scale</td><td>Auth, rate limits, connection pools, async/background ingestion, document ACLs, and tenant isolation if multi-user.</td></tr></table>
+
+<h2>10. Interview answers to rehearse</h2>
+<div class="qa"><b>“Why not just send the whole PDF to the model?”</b><br>Context is limited, expensive, and less reliable when irrelevant text crowds out evidence. Retrieval selects a small, attributable context; parent expansion restores only the necessary neighborhood.</div>
+<div class="qa"><b>“Why do you need BM25 if you have embeddings?”</b><br>Technical documentation contains symbolic identifiers and error IDs. BM25 preserves exact-match signal, while embeddings handle paraphrase. Hybrid fusion improves robustness across both query types.</div>
+<div class="qa"><b>“Why parent-child retrieval?”</b><br>Small children create discriminative vectors and accurate ranking. Full sections preserve explanation. I rank children, then attach sibling/full parent context after ranking instead of sacrificing precision up front.</div>
+<div class="qa"><b>“How do you prevent hallucinations?”</b><br>I constrain the prompt to retrieved passages, require numbered citations, return only metadata for citations actually mentioned, and make “not supported by passages” an allowed response. This reduces, but does not mathematically eliminate, hallucination—so I also evaluate retrieval and inspect answers.</div>
+<div class="qa"><b>“What would you improve first?”</b><br>I would expand and harden evaluation, because it tells me which change matters. In parallel I would persist lexical search and add proper migrations/observability before claiming large-scale production readiness.</div>
+
+<h2>Final ownership checklist</h2><ul><li>I can trace one query from API payload to embedding, BM25, RRF, reranker, context expansion, prompt, answer, and citation.</li><li>I can state the exact reason hybrid retrieval exists: semantic recall plus symbolic precision.</li><li>I can distinguish retrieval evaluation from generation evaluation.</li><li>I can name current limitations without defensiveness and propose a measurable next experiment.</li></ul>
+<p class="small">This guide describes the codebase as implemented at the time of generation. Re-run the benchmark after changing chunking, models, candidate limits, or the source corpus.</p>
+</section></body></html>

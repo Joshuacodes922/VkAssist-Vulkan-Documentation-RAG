@@ -2,16 +2,6 @@
 
 `vkassist` is a production-minded RAG backend for Vulkan documentation. It ingests technical PDFs, performs hybrid retrieval, reranks evidence, expands relevant context, and can generate grounded answers with source citations through a local or hosted OpenAI-compatible model.
 
-## Application previews
-
-<p align="center">
-  <img src="docs/screenshots/rag-landing.png" alt="VkAssist RAG landing screen" width="900" />
-</p>
-
-<p align="center">
-  <img src="docs/screenshots/rag-answer.png" alt="VkAssist grounded answer screen" width="900" />
-</p>
-
 ## Architecture
 
 ```text
@@ -75,7 +65,7 @@ Use adjacent child context (the default is one chunk on either side):
 python -m app.search "Explain the graphics pipeline" --rerank --context-window 2
 ```
 
-Return a child’s complete parent section when broad context is required:
+Return a child's complete parent section when broad context is required:
 
 ```powershell
 python -m app.search "Explain swap chain recreation" --rerank --parent-context --context-window 0
