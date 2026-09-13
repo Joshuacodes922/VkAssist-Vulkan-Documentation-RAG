@@ -11,5 +11,15 @@ services:
     volumes:
       - vkassist_data:/var/lib/postgresql/data
 
+  api:
+    build: .
+    container_name: vkassist-api
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgresql+psycopg://vkassist:vkassist@postgres:5432/vkassist
+    ports:
+      - "8000:8000"
+
 volumes:
   vkassist_data:

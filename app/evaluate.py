@@ -1,6 +1,6 @@
 """Compatibility entry point; CLI commands live in app.cli."""
 
-from app.cli.search import *  # noqa: F403
+from app.cli.evaluate import *  # noqa: F403
 
 if __name__ == "__main__":
     main()

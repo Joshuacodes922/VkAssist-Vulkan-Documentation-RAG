@@ -1,84 +1,127 @@
 # vkassist
 
-`vkassist` is a local retrieval-augmented generation (RAG) foundation for searching Vulkan documentation. It extracts text from a PDF, splits it into overlapping chunks, turns those chunks into embeddings, and stores them in PostgreSQL with pgvector for semantic search.
+`vkassist` is a production-minded RAG backend for Vulkan documentation. It ingests technical PDFs, performs hybrid retrieval, reranks evidence, expands relevant context, and can generate grounded answers with source citations through a local or hosted OpenAI-compatible model.
 
-The current command-line interface performs retrieval only: it returns the most relevant source passages and their page numbers. A language-model response layer can be added on top later.
-
-## How it works
+## Architecture
 
 ```text
-Vulkan PDF -> text chunks -> embeddings -> PostgreSQL + pgvector
-User question -> query embedding -> cosine similarity search -> source passages
+PDF
+  → TOC-aware layout extraction
+  → parent sections + bounded child chunks
+  → BGE embeddings + PostgreSQL/pgvector
+
+Query
+  → dense cosine retrieval + BM25 lexical retrieval
+  → reciprocal-rank fusion
+  → cross-encoder reranking
+  → parent sliding-window or full-parent context
+  → optional cited answer generation
 ```
 
-- **PDF extraction and chunking:** PyMuPDF extracts the document; chunks are roughly 1,200 characters with a 200-character overlap.
-- **Embeddings:** `BAAI/bge-base-en-v1.5` creates normalized, 768-dimensional embeddings locally through Sentence Transformers.
-- **Vector search:** PostgreSQL with the pgvector extension stores embeddings and uses an HNSW index for cosine-distance search.
+### Retrieval design
 
-## Requirements
+- **Structure-aware ingestion:** PyMuPDF layout blocks, TOC hierarchy, repeated-header/footer filtering, printed-heading detection, page ranges, and Vulkan API-symbol metadata.
+- **Parent-child indexing:** section parents are stored separately from child chunks. Retrieval ranks children precisely, then can return nearby siblings or the full parent section.
+- **Hybrid retrieval:** normalized `BAAI/bge-base-en-v1.5` embeddings (768 dimensions) use pgvector cosine search alongside BM25 lexical retrieval; reciprocal-rank fusion combines both candidate lists.
+- **Reranking:** `cross-encoder/ms-marco-MiniLM-L6-v2` scores query/chunk pairs after fusion.
+- **Grounded answers:** an optional local Ollama or hosted OpenAI-compatible endpoint receives only retrieved passages and is instructed to cite them.
 
-- Python 3.11 or newer
-- Docker Desktop (or a PostgreSQL instance with the pgvector extension)
-- A Vulkan PDF to ingest
-
-## Setup
-
-1. Create and activate a virtual environment, then install dependencies:
-
-   ```powershell
-   python -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   pip install -r requirements.txt
-   ```
-
-2. Create your local configuration file:
-
-   ```powershell
-   Copy-Item .env.example .env
-   ```
-
-3. Start PostgreSQL with pgvector:
-
-   ```powershell
-   docker compose up -d
-   ```
-
-4. Put a PDF in `data/`, then ingest it. The first run downloads the embedding model; later runs use the local Hugging Face cache.
-
-   ```powershell
-   python -m app.ingest data\vulkan_documentation.pdf --replace
-   ```
-
-5. Search the indexed document:
-
-   ```powershell
-   python -m app.search "What does vkCmdPipelineBarrier do?"
-   ```
-
-   Use `--limit` to change the number of results:
-
-   ```powershell
-   python -m app.search "What does a VkBuffer do?" --limit 3
-   ```
-
-## Configuration
-
-`DATABASE_URL` is read from `.env`. The default value in `.env.example` matches the included Docker Compose service. Keep `.env` local; it is intentionally not committed.
-
-## Project structure
+## Project layout
 
 ```text
 app/
-  chunker.py       PDF parsing and structure-aware chunking
-  embeddings.py    Embedding-model loading and vector generation
-  ingest.py        PDF ingestion command
-  search.py        Semantic-search command
-  database.py      PostgreSQL and pgvector initialization
-  models.py        SQLAlchemy document-chunk model
-compose.yaml       Local PostgreSQL + pgvector service
+  api/          FastAPI endpoints, health, and metrics
+  cli/          Search and benchmark commands
+  core/         Settings, PostgreSQL engine, and ORM models
+  evaluations/  Retrieval metrics and report generation
+  indexing/     Embedding-text construction
+  ingestion/    PDF parsing and document ingestion
+  retrieval/    Dense, BM25, fusion, and reranking stages
+  services/     Grounded answer-generation service
+  tests/        Unit tests
+data/evaluation/  Versioned relevance judgments and reports
 ```
 
-## Notes
+## Quick start
 
-- Re-running ingestion without `--replace` adds another copy of the document's chunks. Use `--replace` when re-ingesting the same PDF.
-- Each `python -m app.search` command starts a new process, so the embedding model is loaded into memory for that command. Model files remain cached locally after their initial download.
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env
+docker compose up -d postgres
+python -m app.ingest data\vulkan_documentation.pdf --replace
+```
+
+Run hybrid retrieval and cross-encoder reranking:
+
+```powershell
+python -m app.search "What does vkCmdPipelineBarrier do?" --rerank --limit 5
+```
+
+Use adjacent child context (the default is one chunk on either side):
+
+```powershell
+python -m app.search "Explain the graphics pipeline" --rerank --context-window 2
+```
+
+Return a child’s complete parent section when broad context is required:
+
+```powershell
+python -m app.search "Explain swap chain recreation" --rerank --parent-context --context-window 0
+```
+
+## API
+
+Start the HTTP service locally:
+
+```powershell
+uvicorn app.api.main:app --host 127.0.0.1 --port 8000
+```
+
+Open interactive API documentation at `http://127.0.0.1:8000/docs`.
+
+```powershell
+$body = @{ query = "What does vkCmdPipelineBarrier do?"; limit = 3; rerank = $true } | ConvertTo-Json
+Invoke-RestMethod http://127.0.0.1:8000/v1/search -Method Post -ContentType application/json -Body $body
+```
+
+The service exposes `/health`, `/metrics`, `/v1/search`, and `/v1/answers`.
+
+### Local Ollama answers
+
+The answer endpoint uses an OpenAI-compatible chat-completions interface. With Ollama running locally:
+
+```env
+LLM_BASE_URL=http://localhost:11434/v1
+LLM_MODEL=qwen3:4b
+LLM_API_KEY=ollama
+LLM_TIMEOUT_SECONDS=120
+LLM_MAX_TOKENS=600
+```
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/v1/answers -Method Post -ContentType application/json -Body $body
+```
+
+For Docker deployment, run `docker compose up --build`. Use `host.docker.internal` instead of `localhost` in `LLM_BASE_URL` when Ollama runs on the Windows host.
+
+## Evaluation
+
+The versioned benchmark has 36 page-labeled Vulkan queries. It records Recall@k, MRR@k, nDCG@k, per-query retrieved pages, and P50/P95 latency.
+
+```powershell
+python -m app.evaluate --output data\evaluation\reports\hybrid-reranked.json
+python -m app.evaluate --no-rerank --output data\evaluation\reports\hybrid-only.json
+```
+
+Treat these starter labels as a maintained benchmark: review labels when the source document or chunking strategy changes, add difficult/negative queries, and compare reports before claiming a retrieval improvement.
+
+## Verification
+
+```powershell
+python -m unittest app.tests.test_chunker app.tests.test_evaluation
+python -m compileall -q app
+```
+
+GitHub Actions runs these checks on pushes and pull requests.

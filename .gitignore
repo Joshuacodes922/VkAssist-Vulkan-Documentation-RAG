@@ -3,4 +3,5 @@
 __pycache__/
 *.py[cod]
 data/*.pdf
+data/evaluation/reports/
 notes.txt
