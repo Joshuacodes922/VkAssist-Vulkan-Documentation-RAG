@@ -30,13 +30,19 @@ def tokenize(text: str) -> list[str]:
 
 
 class BM25Retriever:
-    def __init__(self) -> None:
+    def __init__(self, document_name: str | None = None) -> None:
+        self.document_name = document_name
         with SessionLocal() as session:
+            statement = select(DocumentChunk)
+            if document_name:
+                statement = statement.where(DocumentChunk.document_name == document_name)
             self.chunks = list(
-                session.scalars(
-                    select(DocumentChunk).order_by(DocumentChunk.id)
-                )
+                session.scalars(statement.order_by(DocumentChunk.id))
             )
+
+        if not self.chunks:
+            self.index = None
+            return
 
         tokenized_corpus: list[list[str]] = []
         for chunk in self.chunks:
@@ -45,6 +51,9 @@ class BM25Retriever:
         self.index = BM25Okapi(tokenized_corpus)
 
     def search(self, query: str, limit: int = 20) -> list[RankedChunk]:
+        if not self.index or not self.chunks:
+            return []
+
         scores = self.index.get_scores(tokenize(query))
 
         ranked_indices = sorted(

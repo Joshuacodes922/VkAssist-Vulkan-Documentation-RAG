@@ -60,13 +60,20 @@ python -m venv .venv
 pip install -r requirements.txt
 Copy-Item .env.example .env
 docker compose up -d postgres
+
+# Ingest a single PDF, multiple PDFs, or an entire directory of PDFs:
 python -m app.ingest data\vulkan_documentation.pdf --replace
+python -m app.ingest data\ --replace
 ```
 
-Run hybrid retrieval and cross-encoder reranking:
+Run hybrid retrieval and cross-encoder reranking across all documents or a specific document:
 
 ```powershell
+# Search across all indexed documents
 python -m app.search "What does vkCmdPipelineBarrier do?" --rerank --limit 5
+
+# Search inside a specific document
+python -m app.search "What does vkCmdPipelineBarrier do?" --document "vulkan_documentation.pdf" --rerank --limit 5
 ```
 
 Use adjacent child context (the default is one chunk on either side):
@@ -112,7 +119,7 @@ Use this JSON body to inspect retrieved passages:
 }
 ```
 
-The service also exposes `GET /health`, `GET /metrics`, `POST /v1/answers`, `GET /v1/documents/vulkan-documentation`, and `GET /v1/documents/project-readme`.
+The service also exposes `GET /health`, `GET /metrics`, `POST /v1/answers`, `GET /v1/documents` (lists all indexed documents and stats), `POST /v1/ingest` (upload new PDF), `DELETE /v1/documents/{document_name}`, and `GET /v1/documents/{document_name}`.
 
 ### Local Ollama answers
 

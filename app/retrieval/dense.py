@@ -17,6 +17,7 @@ class RankedChunk:
 def dense_search(
     query: str,
     limit: int = 20,
+    document_name: str | None = None,
 ) -> list[RankedChunk]:
     query_embedding = embed_query(query)
 
@@ -24,14 +25,15 @@ def dense_search(
         query_embedding
     )
 
-    statement = (
-        select(
-            DocumentChunk,
-            distance.label("distance"),
-        )
-        .order_by(distance)
-        .limit(limit)
+    statement = select(
+        DocumentChunk,
+        distance.label("distance"),
     )
+
+    if document_name:
+        statement = statement.where(DocumentChunk.document_name == document_name)
+
+    statement = statement.order_by(distance).limit(limit)
 
     with SessionLocal() as session:
         rows = session.execute(statement).all()

@@ -19,20 +19,25 @@ class SearchResult:
     similarity: float
 
 
-def search_chunks(query: str, limit: int = 5) -> list[SearchResult]:
+def search_chunks(
+    query: str,
+    limit: int = 5,
+    document_name: str | None = None,
+) -> list[SearchResult]:
     query_embedding = embed_query(query)
 
     # pgvector cosine_distance returns 0 for identical vectors.
     distance = DocumentChunk.embedding.cosine_distance(query_embedding)
 
-    statement = (
-        select(
-            DocumentChunk,
-            distance.label("distance"),
-        )
-        .order_by(distance)
-        .limit(limit)
+    statement = select(
+        DocumentChunk,
+        distance.label("distance"),
     )
+
+    if document_name:
+        statement = statement.where(DocumentChunk.document_name == document_name)
+
+    statement = statement.order_by(distance).limit(limit)
 
     with SessionLocal() as session:
         rows = session.execute(statement).all()
@@ -58,12 +63,14 @@ def search_hybrid(
     use_reranker: bool = False,
     context_window: int = 1,
     include_parent: bool = False,
+    document_name: str | None = None,
 ) -> list[HybridResult]:
-    """Retrieve with dense search + BM25 reciprocal-rank fusion."""
-    candidates = HybridRetriever().search(
+    """Retrieve with dense search + BM25 reciprocal-rank fusion across all or specific documents."""
+    candidates = HybridRetriever(document_name=document_name).search(
         query,
         candidate_limit=candidate_limit,
         result_limit=candidate_limit,
+        document_name=document_name,
     )
 
     if use_reranker:
@@ -79,6 +86,10 @@ def search_hybrid(
 
 
 def print_hybrid_results(results: list[HybridResult]) -> None:
+    if not results:
+        print("No matching results found.")
+        return
+
     for position, result in enumerate(results, start=1):
         print("=" * 80)
         print(f"RESULT {position}")
@@ -120,8 +131,9 @@ def print_hybrid_results(results: list[HybridResult]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("query")
+    parser = argparse.ArgumentParser(description="Search across ingested documents in vkassist RAG.")
+    parser.add_argument("query", help="Search query string.")
+    parser.add_argument("--document", type=str, default=None, help="Optional document name to filter results to.")
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument(
         "--hybrid",
@@ -165,11 +177,12 @@ def main() -> None:
             use_reranker=args.rerank,
             context_window=args.context_window,
             include_parent=args.parent_context,
+            document_name=args.document,
         )
         print_hybrid_results(results)
         return
 
-    results = search_chunks(args.query, args.limit)
+    results = search_chunks(args.query, limit=args.limit, document_name=args.document)
 
     for position, result in enumerate(results, start=1):
         print("=" * 80)

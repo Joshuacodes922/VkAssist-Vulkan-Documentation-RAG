@@ -44,22 +44,26 @@ def add_parent_context(
             )
             if chunk.section_id is not None:
                 statement = statement.where(
-                    DocumentChunk.section_id == chunk.section_id)
+                    DocumentChunk.section_id == chunk.section_id
+                )
             result.context_chunks = list(session.scalars(statement))
+
         if include_parent:
             parent_ids = {
                 result.chunk.section_id
                 for result in results
                 if result.chunk.section_id is not None
             }
-            parents = {
-                parent.id: parent
-                for parent in session.scalars(
-                    select(DocumentSection).where(DocumentSection.id.in_(parent_ids))
-                )
-            }
-            for result in results:
-                result.parent_section = parents.get(result.chunk.section_id)
+            if parent_ids:
+                parents = {
+                    parent.id: parent
+                    for parent in session.scalars(
+                        select(DocumentSection).where(DocumentSection.id.in_(parent_ids))
+                    )
+                }
+                for result in results:
+                    result.parent_section = parents.get(result.chunk.section_id)
+
     return results
 
 
@@ -72,7 +76,6 @@ def reciprocal_rank_fusion(
 
     for result in dense_results:
         chunk_id = result.chunk.id
-
         combined.setdefault(
             chunk_id,
             {
@@ -82,15 +85,11 @@ def reciprocal_rank_fusion(
                 "bm25_rank": None,
             },
         )
-
-        combined[chunk_id]["score"] += (
-            1.0 / (rrf_constant + result.rank)
-        )
+        combined[chunk_id]["score"] += 1.0 / (rrf_constant + result.rank)
         combined[chunk_id]["dense_rank"] = result.rank
 
     for result in bm25_results:
         chunk_id = result.chunk.id
-
         combined.setdefault(
             chunk_id,
             {
@@ -100,25 +99,18 @@ def reciprocal_rank_fusion(
                 "bm25_rank": None,
             },
         )
-
-        combined[chunk_id]["score"] += (
-            1.0 / (rrf_constant + result.rank)
-        )
+        combined[chunk_id]["score"] += 1.0 / (rrf_constant + result.rank)
         combined[chunk_id]["bm25_rank"] = result.rank
 
-    fused_results = []
-
-    for value in combined.values():
-        result = HybridResult(
+    fused_results = [
+        HybridResult(
             chunk=value["chunk"],
             rrf_score=value["score"],
             dense_rank=value["dense_rank"],
             bm25_rank=value["bm25_rank"],
         )
-
-        fused_results.append(result)
-
-
+        for value in combined.values()
+    ]
 
     return sorted(
         fused_results,
@@ -128,24 +120,29 @@ def reciprocal_rank_fusion(
 
 
 class HybridRetriever:
-    def __init__(self) -> None:
-        self.bm25 = BM25Retriever()
+    def __init__(self, document_name: str | None = None) -> None:
+        self.document_name = document_name
+        self.bm25 = BM25Retriever(document_name=document_name)
 
     def search(
         self,
         query: str,
         candidate_limit: int = 20,
         result_limit: int = 10,
+        document_name: str | None = None,
     ) -> list[HybridResult]:
+        doc_filter = document_name or self.document_name
+
         dense_results = dense_search(
             query,
             limit=candidate_limit,
+            document_name=doc_filter,
         )
 
         bm25_results = self.bm25.search(
             query,
             limit=candidate_limit,
-        )
+        ) if (doc_filter == self.document_name) else BM25Retriever(document_name=doc_filter).search(query, limit=candidate_limit)
 
         fused = reciprocal_rank_fusion(
             dense_results,

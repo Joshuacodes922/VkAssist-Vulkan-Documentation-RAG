@@ -11,10 +11,21 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--candidate-limit", type=int, default=25)
     parser.add_argument("--no-rerank", action="store_true")
+    parser.add_argument(
+        "--filter-document",
+        action="store_true",
+        help="Constrain retrieval per-case to the case's document field if specified.",
+    )
     parser.add_argument("--output", type=Path, help="Optional JSON report path.")
     args = parser.parse_args()
 
-    report = evaluate(load_cases(args.dataset), args.limit, args.candidate_limit, not args.no_rerank)
+    report = evaluate(
+        load_cases(args.dataset),
+        limit=args.limit,
+        candidate_limit=args.candidate_limit,
+        use_reranker=not args.no_rerank,
+        filter_by_case_document=args.filter_document,
+    )
     rendered = json.dumps(report, indent=2)
     print(rendered)
     if args.output:
