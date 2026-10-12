@@ -36,6 +36,68 @@ Query
 - **Reranking:** `cross-encoder/ms-marco-MiniLM-L6-v2` scores query/chunk pairs after fusion.
 - **Grounded answers:** an optional local Ollama or hosted OpenAI-compatible endpoint receives only retrieved passages and is instructed to cite them.
 
+## How the RAG pipeline works
+
+The application has two phases: **ingest PDF documents into the knowledge base**, then **retrieve relevant evidence for each query**. PostgreSQL with pgvector stores the document sections, searchable child chunks, and dense vectors used at query time.
+
+### Ingestion
+
+1. **Choose PDF sources.** Run `python -m app.ingest` with a PDF path, several PDF paths, or a directory. For example, `python -m app.ingest data\ --replace` discovers the PDFs under `data\`.
+2. **Extract and structure content.** PyMuPDF reads text and layout, using table-of-contents and detected headings to organize content into parent sections and bounded child chunks. The parser retains page ranges and Vulkan API-symbol metadata.
+3. **Prepare embedding text.** Each child chunk is combined with relevant source metadata, such as its document name, section, page number, and API symbols.
+4. **Generate and save vectors.** The BGE embedding model encodes the chunk text. The application saves each chunk, its vector, and its parent-section relationship in PostgreSQL/pgvector.
+5. **Update documents safely.** `--replace` replaces indexed sections and chunks for the PDF files passed to that command. It leaves other indexed documents untouched; `--replace-all` clears the entire index before ingesting the selected PDFs.
+
+Ingestion runs as a command-line task and needs to complete before those documents can be retrieved. The same parsing and indexing pipeline is also used by `POST /v1/ingest` for PDF uploads.
+
+### Query and answer
+
+1. **Accept a search request.** `POST /v1/search` and `POST /v1/answers` accept a query and options such as result limit, document filter, reranking, and context size.
+2. **Retrieve candidates in parallel paths.** Dense retrieval embeds the query and finds nearby vectors in pgvector. BM25 tokenizes the query and indexed chunk text, preserving Vulkan identifiers such as `vkQueueSubmit`, `VK_*` constants, and VUIDs.
+3. **Fuse and optionally rerank.** Reciprocal-rank fusion combines the two candidate rankings. When reranking is enabled, the cross-encoder scores each query/candidate passage pair and reorders the results by relevance.
+4. **Add context and source metadata.** The service can attach neighboring chunks or the full parent section, and returns document names, section paths, source pages, API symbols, and retrieval scores.
+5. **Return evidence or generate an answer.** `/v1/search` returns the passages directly. `/v1/answers` passes the retrieved passages to the configured OpenAI-compatible chat model, which must answer from that evidence and cite its sources. Answer generation requires `LLM_BASE_URL` and `LLM_MODEL`; retrieval itself does not.
+
+The API initializes the database and loads the embedding and reranking models on startup. On first use, model files may need to be downloaded. A successful `/health` response confirms the API can connect to PostgreSQL; ingest the PDFs separately to populate a new or empty database.
+
+### RAG data flow
+
+```mermaid
+flowchart TD
+    subgraph INGEST["1. Offline document ingestion"]
+        PDF["Source PDF files"] --> CLI["CLI: python -m app.ingest"]
+        PDFAPI["Uploaded PDF: POST /v1/ingest"] --> SAVE["Save PDF under data/"]
+        CLI --> DISCOVER["Discover PDF files"]
+        SAVE --> PARSE
+        DISCOVER --> PARSE["Extract PDF text, layout, TOC, and page information"]
+        PARSE --> CHUNK["Build parent sections and bounded child chunks"]
+        CHUNK --> META["Attach document, section, page-range, and Vulkan-symbol metadata"]
+        META --> TEXT["Build embedding text for each child chunk"]
+        TEXT --> EMBED["BGE model generates dense vectors"]
+        EMBED --> DB["Persist sections, chunks, relationships, and vectors in PostgreSQL/pgvector"]
+    end
+
+    subgraph SEARCH["2. Online search and answer generation"]
+        CLIENT["Client sends query and retrieval options"] --> API{"Endpoint"}
+        API -- "POST /v1/search" --> RETRIEVE["Validate request and retrieve candidates"]
+        API -- "POST /v1/answers" --> RETRIEVE
+        RETRIEVE --> DENSE["Dense retrieval: embed query and search pgvector"]
+        RETRIEVE --> BM25["BM25 retrieval: match terms and Vulkan identifiers"]
+        DB --> DENSE
+        DB --> BM25
+        DENSE --> FUSE["Combine rankings with reciprocal-rank fusion"]
+        BM25 --> FUSE
+        FUSE --> RERANK{"Reranking enabled?"}
+        RERANK -- Yes --> CROSS["Cross-encoder reranks query and passage pairs"]
+        RERANK -- No --> CONTEXT
+        CROSS --> CONTEXT["Select results and attach requested neighboring or parent context"]
+        CONTEXT --> RESPONSE{"Endpoint"}
+        RESPONSE -- "/v1/search" --> PASSAGES["Return passages and source metadata as JSON"]
+        RESPONSE -- "/v1/answers" --> LLM["Configured chat model answers from retrieved passages"]
+        LLM --> CITATIONS["Return answer and citations for cited documents, sections, and pages"]
+    end
+```
+
 ## Project layout
 
 ```text
@@ -157,14 +219,16 @@ For Docker deployment, run `docker compose up --build`. Use `host.docker.interna
 
 ## Evaluation
 
-The versioned benchmark has 36 page-labeled Vulkan queries. It records Recall@k, MRR@k, nDCG@k, per-query retrieved pages, and P50/P95 latency.
+The versioned benchmark has 72 page-labeled Vulkan queries: 36 tutorial queries judged against `vulkan_documentation.pdf` and 36 specification queries judged against `vkspec.pdf`. Relevance requires both the expected document and a matching page, so a coincidentally matching page number from another PDF is not counted. It records Recall@k, MRR@k, nDCG@k, per-query retrieved documents/pages, and P50/P95 latency.
 
 ```powershell
 python -m app.evaluate --output data\evaluation\reports\hybrid-reranked.json
 python -m app.evaluate --no-rerank --output data\evaluation\reports\hybrid-only.json
 ```
 
-Treat these starter labels as a maintained benchmark: review labels when the source document or chunking strategy changes, add difficult/negative queries, and compare reports before claiming a retrieval improvement.
+These commands evaluate global retrieval across the indexed corpus while scoring only evidence from each case's labeled source document. To measure the document-filtered baseline as well, pass `--filter-document`; this restricts each query to its labeled document. Reports made from older page-only labels should be regenerated and not compared directly with document-aware reports.
+
+Treat these starter labels as a maintained benchmark: review labels when the source document or chunking strategy changes, add difficult/negative queries, and compare reports before claiming a retrieval improvement. Cases are split evenly between the tutorial and Vulkan specification so global search can be measured on both documents. `vulkan11-reference-guide.pdf` is not yet represented in the relevance judgments.
 
 ## Verification
 
